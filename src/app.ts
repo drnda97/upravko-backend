@@ -16,7 +16,7 @@ import { issueRoutes } from './routes/issues.js';
 import { threadRoutes } from './routes/threads.js';
 
 export async function buildApp(opts: { rateLimit?: boolean } = {}) {
-  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' && { level: 'warn' }, bodyLimit: 3 * 1024 * 1024 });
+  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' && { level: 'warn' }, bodyLimit: 3 * 1024 * 1024, trustProxy: true });
 
   await app.register(helmet, { crossOriginResourcePolicy: { policy: 'cross-origin' } });
   await app.register(cors, { origin: config.production ? config.corsOrigins : true, methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'] });
