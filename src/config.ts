@@ -21,8 +21,15 @@ export const config = {
   mailFrom: env.MAIL_FROM ?? 'Upravko <no-reply@upravko.rs>',
   appLink: env.APP_LINK ?? 'upravko://',
   demoNow: env.DEMO_NOW ?? '',
+  // Adrese proksija kojima se veruje X-Forwarded-For (lista IP/CIDR ili loopback, linklocal, uniquelocal).
+  trustProxy: env.TRUST_PROXY ?? 'loopback,linklocal,uniquelocal',
   production: env.NODE_ENV === 'production',
 };
 
 if (config.jwtSecret.length < 32) throw new Error('JWT_SECRET mora da ima najmanje 32 karaktera');
+// Podrazumevana vrednost iz .env.example ima 32+ karaktera, pa prođe proveru dužine; u produkciji je javno
+// poznata (falsifikovanje tokena), zato se izričito odbija.
+if (config.production && config.jwtSecret === 'dev-only-secret-change-me-please-32chars') {
+  throw new Error('JWT_SECRET je podrazumevana vrednost iz .env.example; postavi svoju tajnu u produkciji');
+}
 if (config.production && config.demoNow) throw new Error('DEMO_NOW nije dozvoljen u produkciji');

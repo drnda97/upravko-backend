@@ -127,8 +127,8 @@ export async function threadRoutes(app: FastifyInstance) {
     const uid = userId(req);
     const { thread, access } = await threadAccess(uid, (req.params as { id: string }).id);
     if (access.role !== 'manager') throw forbidden('Ovo može samo upravnik.');
-    if (thread.converted_issue_id) throw conflict('converted', 'Već je pretvoreno u javni problem.');
-    await exec(pool, 'UPDATE private_threads SET conversion_requested_at = ?, conversion_declined_at = NULL WHERE id = ?', [now(), thread.id]);
+    const result = await exec(pool, 'UPDATE private_threads SET conversion_requested_at = ?, conversion_declined_at = NULL WHERE id = ? AND converted_issue_id IS NULL', [now(), thread.id]);
+    if (!result.affectedRows) throw conflict('converted', 'Već je pretvoreno u javni problem.');
     notifyOther(thread, access, 'Zahtev za javni problem', thread.subject);
     return { ok: true };
   });
@@ -142,15 +142,18 @@ export async function threadRoutes(app: FastifyInstance) {
       location: z.enum(['ulaz', 'lift', 'stepeniste', 'krov', 'podrum', 'fasada', 'parking', 'ostalo']).default('ostalo'),
       urgency: z.enum(['low', 'medium', 'high']).default('medium'),
     }).parse(req.body);
-    if (!thread.conversion_requested_at || thread.conversion_consented_at || thread.conversion_declined_at) throw badRequest('no_request', 'Nema zahteva na čekanju.');
+    const pending = (t: Row) => !!t.conversion_requested_at && !t.conversion_consented_at && !t.conversion_declined_at;
+    if (!pending(thread)) throw badRequest('no_request', 'Nema zahteva na čekanju.');
     if (!body.accept) {
-      await exec(pool, 'UPDATE private_threads SET conversion_declined_at = ? WHERE id = ?', [now(), thread.id]);
+      await exec(pool, 'UPDATE private_threads SET conversion_declined_at = ? WHERE id = ? AND conversion_consented_at IS NULL AND conversion_declined_at IS NULL', [now(), thread.id]);
       notifyOther(thread, access, thread.subject, 'Stanar nije prihvatio objavljivanje.');
       return { ok: true };
     }
     const first = await one(pool, 'SELECT body FROM private_messages WHERE thread_id = ? ORDER BY created_at LIMIT 1', [thread.id]);
     const issueId = uuid();
     await tx(async (db) => {
+      // Ponovna provera pod ključem: dvostruki pristanak ne sme da napravi dva problema.
+      if (!pending((await one(db, 'SELECT * FROM private_threads WHERE id = ? FOR UPDATE', [thread.id]))!)) throw badRequest('no_request', 'Nema zahteva na čekanju.');
       await exec(
         db,
         'INSERT INTO issues (id, building_id, title, description, location, urgency, reporter_user_id, reporter_apartment_id, is_anonymous, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',

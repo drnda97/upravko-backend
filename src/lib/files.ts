@@ -13,6 +13,19 @@ export const ALLOWED_MIME: Record<string, string> = {
   'application/pdf': 'pdf',
 };
 
+/** Tip se proverava po sadržaju fajla, ne po onome što je klijent poslao kao MIME. */
+export function contentMatches(mime: string, data: Buffer) {
+  const at = (offset: number, text: string) => data.subarray(offset, offset + text.length).toString('latin1') === text;
+  switch (mime) {
+    case 'image/jpeg': return data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+    case 'image/png': return at(0, '\x89PNG\r\n\x1a\n');
+    case 'image/webp': return at(0, 'RIFF') && at(8, 'WEBP');
+    case 'image/heic': return at(4, 'ftyp');
+    case 'application/pdf': return at(0, '%PDF-');
+    default: return false;
+  }
+}
+
 const URL_TTL_S = 7 * 24 * 3600;
 const sign = (name: string, exp: number) =>
   createHmac('sha256', config.jwtSecret).update(`${name}.${exp}`).digest('base64url');

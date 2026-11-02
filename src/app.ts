@@ -16,7 +16,9 @@ import { issueRoutes } from './routes/issues.js';
 import { threadRoutes } from './routes/threads.js';
 
 export async function buildApp(opts: { rateLimit?: boolean } = {}) {
-  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' && { level: 'warn' }, bodyLimit: 3 * 1024 * 1024, trustProxy: true });
+  // Veruje se samo proksiju na lokalnoj mreži (Cloudflare tunel); njegov X-Forwarded-For daje pravu adresu klijenta.
+  // trustProxy: true bi uzimao adresu koju klijent sam upiše u zaglavlje, pa bi limit prijave mogao da se zaobiđe.
+  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' && { level: 'warn' }, bodyLimit: 3 * 1024 * 1024, trustProxy: config.trustProxy });
 
   await app.register(helmet, { crossOriginResourcePolicy: { policy: 'cross-origin' } });
   await app.register(cors, { origin: config.production ? config.corsOrigins : true, methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'] });

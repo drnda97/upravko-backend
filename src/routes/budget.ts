@@ -3,16 +3,17 @@ import { z } from 'zod';
 import { exec, one, pool, rows, tx, uuid, type Db } from '../db.js';
 import { buildingAccess, requireManager } from '../lib/access.js';
 import { userId } from '../lib/auth.js';
-import { addEntry, allocatePayment, balance, overdueTotal, reservations } from '../lib/budget.js';
-import { localDate, now } from '../lib/clock.js';
+import { addEntry, allocatePayment, apartmentCredit, balance, creditOf, overdueTotal, rebalanceApartment, reservations } from '../lib/budget.js';
+import { isIsoDate, localDate, now } from '../lib/clock.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { assertOwnUpload, signedUrl } from '../lib/files.js';
 import { allChargesReference, chargeReference, fullReference, ipsPayload, parseReference } from '../lib/ips.js';
 import { toBuilding } from '../lib/realtime.js';
 import { settleClaims } from './claims.js';
 
-const amount = z.coerce.number().positive('Unesite iznos.').max(1e10);
-const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+// Iznosi se čuvaju na dve decimale, pa je 0,01 najmanji iznos koji ima smisla.
+const amount = z.coerce.number().min(0.01, 'Unesite iznos.').max(1e10);
+const date = z.string().refine(isIsoDate, 'Datum nije ispravan.').refine((d) => d <= localDate(), 'Datum ne može da bude u budućnosti.');
 
 function monthsBack(today: string, count: number) {
   const year = Number(today.slice(0, 4));
@@ -40,6 +41,8 @@ async function myCharges(buildingId: string, apartmentId: string, apartmentNumbe
     : new Set();
   const unpaid = list.filter((c) => !c.paid_at).sort((x, y) => x.period.localeCompare(y.period));
   const payable = unpaid.filter((c) => !claimed.has(c.id));
+  // Preplata je uvek manja od najstarije otvorene rate (veća bi je zatvorila), pa se samo oduzima od iznosa za uplatu.
+  const credit = await apartmentCredit(pool, apartmentId);
   // IPS postoji samo za dinarske uplate direktno na račun zgrade.
   const canPay = b!.payment_mode === 'direct' && b!.currency === 'RSD' && !!b!.bank_account;
   const recipient = b!.recipient_name ?? `SZ ${b!.address}`;
@@ -47,16 +50,17 @@ async function myCharges(buildingId: string, apartmentId: string, apartmentNumbe
     amount, recipient, account: b!.bank_account, reference: fullReference(reference),
     payload: ipsPayload({ account: b!.bank_account, recipient, amount, purpose, reference }),
   });
+  const owed = (total: number) => Math.round(Math.max(total - Math.max(credit, 0), 0) * 100) / 100;
   const next = payable[0];
   const ips = canPay && next
-    ? { ...qr(next.amount, chargeReference(apartmentNumber, next.period), `Rata ${next.period} stan ${apartmentNumber}`), period: next.period }
+    ? { ...qr(owed(next.amount), chargeReference(apartmentNumber, next.period), `Rata ${next.period} stan ${apartmentNumber}`), period: next.period }
     : null;
   const ipsAll = canPay && payable.length > 1
-    ? { ...qr(payable.reduce((sum, c) => sum + c.amount, 0), allChargesReference(apartmentNumber), `Rate stan ${apartmentNumber}`), periods: payable.map((c) => c.period) }
+    ? { ...qr(owed(payable.reduce((sum, c) => sum + c.amount, 0)), allChargesReference(apartmentNumber), `Rate stan ${apartmentNumber}`), periods: payable.map((c) => c.period) }
     : null;
   return {
     apartmentNumber, feeAmount: b!.fee_amount, feeMode: b!.fee_mode, paymentMode: b!.payment_mode,
-    debt: unpaid.reduce((sum, c) => sum + c.amount, 0), nextDue: unpaid[0]?.due_date ?? null,
+    debt: owed(unpaid.reduce((sum, c) => sum + c.amount, 0)), credit: Math.max(credit, 0), nextDue: unpaid[0]?.due_date ?? null,
     paid: list.filter((c) => c.paid_at).map((c) => ({ period: c.period, amount: c.amount, paidOn: c.paid_on })),
     unpaid: unpaid.map((c) => ({ id: c.id, period: c.period, amount: c.amount, dueDate: c.due_date, claimed: claimed.has(c.id) })),
     pendingClaim: pending.length ? { amount: pending.reduce((sum, c) => sum + c.amount, 0), createdAt: pending[0]!.created_at } : null,
@@ -100,7 +104,10 @@ async function bookLine(db: Db, buildingId: string, uid: string, line: { occurre
     buildingId, type: 'income', sign: 1, amount: line.amount, title: `Uplata, stan ${line.apartmentNumber}`,
     occurredOn: line.occurredOn, apartmentId: line.apartmentId, createdBy: uid,
   });
-  await allocatePayment(db, line.apartmentId, entryId, line.amount, line.chargeId);
+  const paid = await allocatePayment(db, line.apartmentId, entryId, line.chargeId ? [line.chargeId] : []);
+  // Izabrana rata mora da pripada stanu, da bude otvorena i da je uplata (sa preplatom) pokriva; inače se ništa ne knjiži.
+  // Bez izabrane rate delimična uplata ostaje preplata stana.
+  if (line.chargeId && !paid.includes(line.chargeId)) throw badRequest('bad_charge', 'Izabrana rata nije otvorena za ovaj stan ili je uplata manja od rate.');
   await settleClaims(db, line.apartmentId);
   return entryId;
 }
@@ -126,15 +133,15 @@ function parseAmount(raw: string) {
   const s = raw.replace(/\s|RSD/g, '');
   const normalized = s.includes(',') ? s.replace(/\./g, '').replace(',', '.') : s;
   const value = Number(normalized);
-  if (!Number.isFinite(value) || value <= 0) return null;
+  if (!Number.isFinite(value) || value < 0.01) return null;
   return value;
 }
 
 function parseDate(raw: string) {
   const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return iso[0];
   const local = raw.match(/^(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/);
-  return local ? `${local[3]}-${local[2]!.padStart(2, '0')}-${local[1]!.padStart(2, '0')}` : null;
+  const value = iso ? iso[0] : local ? `${local[3]}-${local[2]!.padStart(2, '0')}-${local[1]!.padStart(2, '0')}` : null;
+  return value && isIsoDate(value) && value <= localDate() ? value : null;
 }
 
 export function parseStatement(csv: string) {
@@ -184,7 +191,7 @@ export async function budgetRoutes(app: FastifyInstance) {
     await requireManager(userId(req), id);
     const overdue = await rows(
       pool,
-      `SELECT a.id AS apartment_id, a.number, SUM(c.amount) AS total, COUNT(*) AS months,
+      `SELECT a.id AS apartment_id, a.number, SUM(c.amount) AS total, COUNT(*) AS months, ${creditOf('a.id')} AS credit,
         (SELECT u.full_name FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.apartment_id = a.id AND m.status = 'approved' ORDER BY m.role, m.created_at LIMIT 1) AS resident
        FROM charges c JOIN apartments a ON a.id = c.apartment_id
        WHERE c.building_id = ? AND c.paid_at IS NULL AND c.cancelled_at IS NULL AND c.due_date < ? GROUP BY a.id ORDER BY total DESC, a.number`,
@@ -198,7 +205,13 @@ export async function budgetRoutes(app: FastifyInstance) {
        WHERE i.building_id = ? AND l.status = 'unmatched' ORDER BY l.occurred_on, l.id`,
       [id],
     );
-    const entries = await rows(pool, 'SELECT id, title, sign, amount, occurred_on AS occurredOn FROM ledger_entries WHERE building_id = ? AND apartment_id IS NOT NULL ORDER BY occurred_on DESC, created_at DESC LIMIT 50', [id]);
+    const entries = await rows(
+      pool,
+      `SELECT l.id, l.title, l.sign, l.amount, l.occurred_on AS occurredOn, l.reverses_entry_id IS NOT NULL AS reversal,
+         EXISTS(SELECT 1 FROM ledger_entries r WHERE r.reverses_entry_id = l.id) AS reversed
+       FROM ledger_entries l WHERE l.building_id = ? AND l.apartment_id IS NOT NULL ORDER BY l.occurred_on DESC, l.created_at DESC LIMIT 50`,
+      [id],
+    );
     const claims = await rows(
       pool,
       `SELECT p.id, p.amount, p.created_at, a.id AS apartment_id, a.number, u.full_name,
@@ -207,13 +220,18 @@ export async function budgetRoutes(app: FastifyInstance) {
        WHERE p.building_id = ? AND p.status = 'pending' ORDER BY p.created_at`,
       [id],
     );
+    // Dug po stanu je umanjen za preplatu; preplata se prikazuje posebno.
+    const net = overdue.map((o) => {
+      const credit = Math.max(Number(o.credit), 0);
+      return { apartmentId: o.apartment_id, apartmentNumber: o.number, resident: o.resident, total: Math.round((Number(o.total) - credit) * 100) / 100, credit, months: Number(o.months) };
+    }).sort((x, y) => y.total - x.total || x.apartmentNumber - y.apartmentNumber);
     return {
       claims: claims.map((c) => ({ id: c.id, amount: c.amount, createdAt: c.created_at, apartmentNumber: c.number, resident: c.full_name, periods: (c.periods ?? '').split(',').filter(Boolean) })),
-      overdueTotal: overdue.reduce((sum, o) => sum + Number(o.total), 0),
-      overdue: overdue.map((o) => ({ apartmentId: o.apartment_id, apartmentNumber: o.number, resident: o.resident, total: Number(o.total), months: Number(o.months) })),
+      overdueTotal: Math.round(net.reduce((sum, o) => sum + o.total, 0) * 100) / 100,
+      overdue: net,
       lastImport: lastImport ? { fileName: lastImport.file_name, total: Number(stats?.total ?? 0), matched: Number(stats?.matched ?? 0) } : null,
       unmatched: unmatched.map((l) => ({ id: l.id, payer: l.payer, amount: l.amount, reference: l.reference, purpose: l.purpose, occurredOn: l.occurred_on })),
-      payments: entries.map((e) => ({ ...e, amount: e.sign * e.amount })),
+      payments: entries.map((e) => ({ id: e.id, title: e.title, occurredOn: e.occurredOn, amount: e.sign * e.amount, reversal: !!e.reversal, reversed: !!e.reversed })),
     };
   });
 
@@ -271,13 +289,17 @@ export async function budgetRoutes(app: FastifyInstance) {
     if (!entry) throw notFound();
     await requireManager(uid, entry.building_id);
     if (entry.type === 'reversal' || entry.type === 'opening') throw badRequest('bad_entry', 'Ova stavka ne može da se stornira.');
-    if (await one(pool, 'SELECT 1 AS ok FROM ledger_entries WHERE reverses_entry_id = ?', [entry.id])) throw conflict('already_reversed', 'Stavka je već stornirana.');
     const id = await tx(async (db) => {
+      // Zaključavanje originala: dva istovremena storna ne smeju oba da prođu.
+      await one(db, 'SELECT id FROM ledger_entries WHERE id = ? FOR UPDATE', [entry.id]);
+      if (await one(db, 'SELECT 1 AS ok FROM ledger_entries WHERE reverses_entry_id = ?', [entry.id])) throw conflict('already_reversed', 'Stavka je već stornirana.');
       await exec(db, 'UPDATE charges SET paid_at = NULL, payment_entry_id = NULL WHERE payment_entry_id = ?', [entry.id]);
-      return addEntry(db, {
+      const reversalId = await addEntry(db, {
         buildingId: entry.building_id, type: 'reversal', sign: entry.sign === 1 ? -1 : 1, amount: entry.amount, title: `Storno: ${entry.title}`,
         apartmentId: entry.apartment_id, issueId: entry.issue_id, reversesEntryId: entry.id, createdBy: uid,
       });
+      if (entry.apartment_id) await rebalanceApartment(db, entry.apartment_id);
+      return reversalId;
     });
     toBuilding(entry.building_id, 'budget');
     return { id };
@@ -301,15 +323,20 @@ export async function budgetRoutes(app: FastifyInstance) {
         const period = reference ? `20${reference.slice(-4, -2)}-${reference.slice(-2)}` : '';
         // Poziv "stan + 0000" je uplata svih dugovanja: raspoređuje se na najstarija.
         const payAll = reference?.endsWith('0000');
-        const charge = apartment
+        let charge = apartment
           ? await one(
               db,
               payAll
-                ? 'SELECT id FROM charges WHERE apartment_id = ? AND paid_at IS NULL AND cancelled_at IS NULL ORDER BY period LIMIT 1 FOR UPDATE'
-                : 'SELECT id FROM charges WHERE apartment_id = ? AND period = ? AND paid_at IS NULL AND cancelled_at IS NULL AND amount = ? FOR UPDATE',
-              payAll ? [apartment.id] : [apartment.id, period, line.amount],
+                ? 'SELECT id, amount FROM charges WHERE apartment_id = ? AND paid_at IS NULL AND cancelled_at IS NULL ORDER BY period LIMIT 1 FOR UPDATE'
+                : 'SELECT id, amount FROM charges WHERE apartment_id = ? AND period = ? AND paid_at IS NULL AND cancelled_at IS NULL FOR UPDATE',
+              payAll ? [apartment.id] : [apartment.id, period],
             )
           : undefined;
+        // Rata po pozivu se priznaje za pun iznos ili za iznos umanjen za preplatu (kako ga daje IPS kod).
+        if (charge && !payAll) {
+          const credit = Math.max(await apartmentCredit(db, apartment!.id), 0);
+          if (![charge.amount, charge.amount - credit].some((a) => Math.abs(a - line.amount) < 0.005)) charge = undefined;
+        }
         let entryId: string | null = null;
         if (apartment && charge) {
           entryId = await bookLine(db, id, uid, { occurredOn: line.occurredOn, amount: line.amount, apartmentId: apartment.id, apartmentNumber: apartment.number, chargeId: payAll ? null : charge.id });
@@ -333,10 +360,12 @@ export async function budgetRoutes(app: FastifyInstance) {
     if (!line) throw notFound();
     await requireManager(uid, line.building_id);
     const body = z.object({ apartmentId: z.string().uuid('Izaberite stan.'), chargeId: z.string().uuid().nullable().optional() }).parse(req.body);
-    if (line.status === 'matched') throw conflict('already_linked', 'Uplata je već povezana.');
     const apartment = await one(pool, 'SELECT number FROM apartments WHERE id = ? AND building_id = ?', [body.apartmentId, line.building_id]);
     if (!apartment) throw badRequest('bad_apartment', 'Izaberite stan iz liste.');
     await tx(async (db) => {
+      // Status se proverava pod ključem: dvostruki klik ne sme da knjiži uplatu dvaput.
+      const current = await one(db, 'SELECT status FROM bank_import_lines WHERE id = ? FOR UPDATE', [line.id]);
+      if (current!.status === 'matched') throw conflict('already_linked', 'Uplata je već povezana.');
       const entryId = await bookLine(db, line.building_id, uid, { occurredOn: line.occurred_on, amount: line.amount, apartmentId: body.apartmentId, apartmentNumber: apartment.number, chargeId: body.chargeId });
       await exec(db, "UPDATE bank_import_lines SET status = 'matched', matched_apartment_id = ?, matched_charge_id = ?, ledger_entry_id = ? WHERE id = ?", [body.apartmentId, body.chargeId ?? null, entryId, line.id]);
     });

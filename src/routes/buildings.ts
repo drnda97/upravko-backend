@@ -6,7 +6,7 @@ import { exec, one, pool, rows, tx, uuid, type Db } from '../db.js';
 import { buildingAccess, requireManager } from '../lib/access.js';
 import { randomToken, sha256, userId } from '../lib/auth.js';
 import { brandOf } from '../lib/brand.js';
-import { balance, overdueTotal, reservations } from '../lib/budget.js';
+import { apartmentCredit, balance, overdueTotal, reservations } from '../lib/budget.js';
 import { localDate, now } from '../lib/clock.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { assertOwnUpload, signedUrl } from '../lib/files.js';
@@ -213,8 +213,9 @@ export async function buildingRoutes(app: FastifyInstance) {
     const m = await one(pool, 'SELECT m.*, b.address FROM memberships m JOIN buildings b ON b.id = m.building_id WHERE m.id = ?', [id]);
     if (!m) throw notFound();
     await requireManager(uid, m.building_id);
-    if (m.status !== 'pending') throw conflict('already_decided', 'O ovom zahtevu je već odlučeno.');
-    await exec(pool, 'UPDATE memberships SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?', [status, uid, now(), id]);
+    // Uslov u samom UPDATE-u: od dva istovremena klika prolazi samo jedan.
+    const result = await exec(pool, "UPDATE memberships SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'pending'", [status, uid, now(), id]);
+    if (!result.affectedRows) throw conflict('already_decided', 'O ovom zahtevu je već odlučeno.');
     toUsers([m.user_id], 'memberships');
     toBuilding(m.building_id, 'memberships');
     if (status === 'approved') pushLater([m.user_id], { title: 'Pristup je odobren', body: m.address, data: { screen: 'home', buildingId: m.building_id } });
@@ -224,6 +225,8 @@ export async function buildingRoutes(app: FastifyInstance) {
   app.post('/memberships/:id/reject', decide('rejected'));
 
   // Upravnik ručno dodaje stanara (ekran 16): pristup je odmah odobren.
+  // Postojeći nalog sme da se doda samo ako ga organizacija već poznaje (stanar ili upravnik neke njene zgrade);
+  // tuđi nalog bi tako dobio pristup bez pristanka, a upravnik njegove podatke. Takav stanar se prijavljuje preko QR koda.
   app.post('/buildings/:id/residents', async (req) => {
     const uid = userId(req);
     const { id } = req.params as { id: string };
@@ -240,6 +243,16 @@ export async function buildingRoutes(app: FastifyInstance) {
     const token = randomToken();
     const isNew = await tx(async (db) => {
       const existing = await one(db, 'SELECT id FROM users WHERE email = ?', [body.email]);
+      if (existing) {
+        const known = await one(
+          db,
+          `SELECT 1 AS ok FROM buildings b WHERE b.organization_id = (SELECT organization_id FROM buildings WHERE id = ?) AND (
+             EXISTS(SELECT 1 FROM memberships m WHERE m.building_id = b.id AND m.user_id = ? AND m.status = 'approved')
+             OR EXISTS(SELECT 1 FROM building_managers bm WHERE bm.building_id = b.id AND bm.user_id = ?)) LIMIT 1`,
+          [id, existing.id, existing.id],
+        );
+        if (!known) throw conflict('email_taken', 'Nalog sa ovim e-mailom već postoji. Neka se prijavi i skenira QR kod zgrade, pa odobri zahtev.');
+      }
       const residentId = existing?.id ?? uuid();
       if (!existing) await exec(db, 'INSERT INTO users (id, email, full_name, phone, created_at) VALUES (?, ?, ?, ?, ?)', [residentId, body.email, body.fullName, body.phone ?? null, now()]);
       if (await one(db, "SELECT 1 AS ok FROM memberships WHERE apartment_id = ? AND user_id = ? AND status = 'approved'", [body.apartmentId, residentId])) {
@@ -314,9 +327,12 @@ export async function buildingRoutes(app: FastifyInstance) {
   app.post('/buildings/:id/apartments/:apartmentId/remind', async (req) => {
     const { id, apartmentId } = req.params as { id: string; apartmentId: string };
     await requireManager(userId(req), id);
+    const building = await one(pool, 'SELECT b.currency FROM apartments a JOIN buildings b ON b.id = a.building_id WHERE a.id = ? AND b.id = ?', [apartmentId, id]);
+    if (!building) throw notFound('Stan nije pronađen.');
     const owed = await one(pool, 'SELECT COALESCE(SUM(amount), 0) AS total FROM charges WHERE building_id = ? AND apartment_id = ? AND paid_at IS NULL AND cancelled_at IS NULL AND due_date < ?', [id, apartmentId, localDate()]);
+    const total = Math.max(Math.round((Number(owed?.total ?? 0) - Math.max(await apartmentCredit(pool, apartmentId), 0)) * 100) / 100, 0);
     const users = await rows(pool, "SELECT user_id FROM memberships WHERE apartment_id = ? AND status = 'approved'", [apartmentId]);
-    pushLater(users.map((u) => u.user_id), { title: 'Podsetnik za uplatu', body: `Dospeli dug: ${Number(owed?.total ?? 0)} RSD`, urgent: true, data: { screen: 'budget', buildingId: id } });
+    pushLater(users.map((u) => u.user_id), { title: 'Podsetnik za uplatu', body: `Dospeli dug: ${total} ${building.currency}`, urgent: true, data: { screen: 'budget', buildingId: id } });
     return { ok: true };
   });
 }

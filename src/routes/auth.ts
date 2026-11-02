@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { exec, one, pool, rows, tx, uuid, type Db } from '../db.js';
 import { managerIds } from '../lib/access.js';
-import { checkPassword, hashPassword, issueTokens, randomToken, revokeRefresh, rotateRefresh, sha256, userId } from '../lib/auth.js';
+import { checkPasswordConstantTime, hashPassword, issueTokens, randomToken, revokeRefresh, rotateRefresh, sha256, userId } from '../lib/auth.js';
 import { brandOf } from '../lib/brand.js';
 import { now } from '../lib/clock.js';
 import { ApiError, badRequest, conflict, notFound } from '../lib/errors.js';
@@ -57,7 +57,9 @@ export async function authRoutes(app: FastifyInstance) {
   app.post('/auth/login', authLimit, async (req) => {
     const body = z.object({ email, password: z.string() }).parse(req.body);
     const user = await one(pool, 'SELECT id, password_hash FROM users WHERE email = ?', [body.email]);
-    if (!user?.password_hash || !(await checkPassword(body.password, user.password_hash))) {
+    // Uvek izvrši bcrypt (i kad naloga nema), da vreme odgovora ne otkrije koji e-mailovi postoje.
+    const passwordOk = await checkPasswordConstantTime(body.password, user?.password_hash);
+    if (!user?.password_hash || !passwordOk) {
       throw new ApiError(401, 'bad_credentials', 'Pogrešan e-mail ili lozinka.');
     }
     return { ...(await issueTokens(pool, user.id)), user: await publicUser(pool, user.id) };
@@ -147,7 +149,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   app.post('/auth/register-manager', authLimit, async (req) => {
-    const body = z.object({ fullName, phone, email, password, organizationName: z.string().trim().min(2).max(120).optional(), building: buildingInput }).parse(req.body);
+    const body = z.object({ fullName, phone, email, password, organizationName: z.string().trim().max(120).optional().transform((v) => v || undefined), building: buildingInput }).parse(req.body);
     if (body.building.bankAccount && !isValidAccount(body.building.bankAccount)) throw badRequest('bad_account', 'Broj računa nije ispravan (18 cifara).');
     const hash = await hashPassword(body.password);
     const id = uuid();

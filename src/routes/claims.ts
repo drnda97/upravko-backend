@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { exec, one, pool, rows, tx, uuid, type Db } from '../db.js';
 import { managerIds, requireManager, requireResident } from '../lib/access.js';
 import { userId } from '../lib/auth.js';
-import { addEntry } from '../lib/budget.js';
+import { addEntry, allocatePayment, apartmentCredit } from '../lib/budget.js';
 import { now } from '../lib/clock.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { pushLater } from '../lib/push.js';
@@ -47,7 +47,8 @@ export async function claimRoutes(app: FastifyInstance) {
       const payable = await rows(db, `SELECT c.id, c.amount FROM charges c WHERE c.apartment_id = ? AND ${PAYABLE} ORDER BY c.period FOR UPDATE`, [access.apartmentId]);
       const chosen = scope === 'all' ? payable : payable.slice(0, 1);
       if (!chosen.length) throw conflict('nothing_to_claim', 'Nema rate za prijavu. Uplata možda već čeka potvrdu.');
-      const total = chosen.reduce((sum, c) => sum + c.amount, 0);
+      // Stanar uplaćuje rate umanjene za preplatu (isto kao IPS kod).
+      const total = Math.round((chosen.reduce((sum, c) => sum + c.amount, 0) - Math.max(await apartmentCredit(db, access.apartmentId), 0)) * 100) / 100;
       await exec(db, 'INSERT INTO payment_claims (id, building_id, apartment_id, user_id, amount, created_at) VALUES (?, ?, ?, ?, ?, ?)', [claimId, id, access.apartmentId, uid, total, now()]);
       await exec(db, 'INSERT INTO payment_claim_charges (claim_id, charge_id) VALUES ?', [chosen.map((c) => [claimId, c.id])]);
       return total as number;
@@ -71,11 +72,12 @@ export async function claimRoutes(app: FastifyInstance) {
          WHERE cc.claim_id = ? AND c.paid_at IS NULL AND c.cancelled_at IS NULL FOR UPDATE`,
         [claim.id],
       );
-      const total = charges.reduce((sum, c) => sum + c.amount, 0);
+      // Knjiži se samo ono što preplata stana ne pokriva.
+      const total = Math.round((charges.reduce((sum, c) => sum + c.amount, 0) - Math.max(await apartmentCredit(db, claim.apartment_id), 0)) * 100) / 100;
       let entryId: string | null = null;
       if (total > 0) {
         entryId = await addEntry(db, { buildingId: claim.building_id, type: 'income', sign: 1, amount: total, title: `Uplata, stan ${apartment!.number}`, apartmentId: claim.apartment_id, createdBy: uid });
-        await exec(db, 'UPDATE charges SET paid_at = ?, payment_entry_id = ? WHERE id IN (?)', [now(), entryId, charges.map((c) => c.id)]);
+        await allocatePayment(db, claim.apartment_id, entryId, charges.map((c) => c.id));
       }
       await exec(db, "UPDATE payment_claims SET status = 'confirmed', decided_by = ?, decided_at = ?, ledger_entry_id = ? WHERE id = ?", [uid, now(), entryId, claim.id]);
     });

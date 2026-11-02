@@ -22,3 +22,9 @@ const belgrade = new Intl.DateTimeFormat('en-CA', {
 /** Datum (YYYY-MM-DD) u zoni Srbije. */
 export const localDate = (d: Date = now()) => belgrade.format(d);
 export const localPeriod = (d: Date = now()) => localDate(d).slice(0, 7);
+
+/** Postoji li takav dan u kalendaru (odbija 2026-02-30, 2026-13-01). */
+export function isIsoDate(s: string) {
+  const d = new Date(`${s}T00:00:00Z`);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}

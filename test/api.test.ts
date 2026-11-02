@@ -28,7 +28,9 @@ async function login(who: string) {
 
 async function upload(who: string, name: string, type: string) {
   const boundary = '----t';
-  const body = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: ${type}\r\n\r\ndata\r\n--${boundary}--\r\n`;
+  // Server proverava sadržaj, pa fajl počinje potpisom svog tipa.
+  const data = type === 'application/pdf' ? '%PDF-1.4' : type === 'image/png' ? '\x89PNG\r\n\x1a\n' : '\xff\xd8\xff\xe0';
+  const body = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: ${type}\r\n\r\n${data}data\r\n--${boundary}--\r\n`, 'latin1');
   const res = await app.inject({ method: 'POST', url: '/api/v1/uploads', headers: { authorization: `Bearer ${await login(who)}`, 'content-type': `multipart/form-data; boundary=${boundary}` }, payload: body });
   return JSON.parse(res.body).path as string;
 }
@@ -348,7 +350,7 @@ describe('budžet', () => {
   it('izvod sa pozivom za sve rate plaća sva dugovanja stana', async () => {
     await createMonthlyCharges('2026-12-01');
     const ref = (await api('GET', `/buildings/${bulevar}/budget`, 'jelena.kovac')).body.mine.ipsAll.reference;
-    const csv = `datum,uplatilac,iznos,poziv na broj,svrha\n1. 11. 2026.,Jelena,"8.000,00",${ref},rate`;
+    const csv = `datum,uplatilac,iznos,poziv na broj,svrha\n30. 10. 2026.,Jelena,"8.000,00",${ref},rate`;
     expect((await api('POST', `/buildings/${bulevar}/bank-imports`, 'milan.petrovic', { fileName: 'x.csv', csv })).body).toEqual({ total: 1, matched: 1 });
     expect((await api('GET', `/buildings/${bulevar}/budget`, 'jelena.kovac')).body.mine.debt).toBe(0);
     const line = await one(pool, "SELECT ledger_entry_id FROM bank_import_lines WHERE reference = ?", [ref]);
@@ -429,5 +431,210 @@ describe('zatvaranje problema', () => {
     const after = (await api('GET', `/issues/${lift}`, 'jelena.kovac')).body;
     expect(after.status).toBe('planned');
     expect(after.chosenOffer.contractor).toBe('Drugi');
+  });
+});
+
+describe('ispravke posle testiranja', () => {
+  const statuses = (list: { status: number }[]) => list.map((r) => r.status).sort();
+  const apartment = async (number: number) => (await one(pool, 'SELECT id FROM apartments WHERE building_id = ? AND number = ?', [bulevar, number]))!.id as string;
+  const newIssue = async (title: string) =>
+    (await api('POST', `/buildings/${bulevar}/issues`, 'jelena.kovac', { title, description: 'Opis problema za test.', location: 'ulaz', urgency: 'low' })).body.id as string;
+
+  it('upravnik ne može da ubaci tuđ nalog u svoju zgradu', async () => {
+    const apartmentId = await apartment(10);
+    const add = (email: string) => api('POST', `/buildings/${bulevar}/residents`, 'milan.petrovic', { fullName: 'Neko Nekić', email, apartmentId, role: 'tenant' });
+    expect((await add('stanplus.upravnik@test.upravko.rs')).status).toBe(409);
+    expect((await add(`novi.stanar.${Date.now()}@test.upravko.rs`)).status).toBe(200);
+    expect((await add('ana.markovic@test.upravko.rs')).status).toBe(200); // stanarka iste organizacije
+  });
+
+  it('podsetnik ne ide stanu druge zgrade', async () => {
+    const foreign = (await one(pool, 'SELECT id FROM apartments WHERE building_id <> ? LIMIT 1', [bulevar]))!.id;
+    expect((await api('POST', `/buildings/${bulevar}/apartments/${foreign}/remind`, 'milan.petrovic')).status).toBe(404);
+  });
+
+  it('dvostruki klik ne duplira novac, probleme ni odluke', async () => {
+    const pending = (await one(pool, "SELECT id FROM memberships WHERE building_id = ? AND status = 'pending' LIMIT 1", [bulevar]))!.id;
+    expect(statuses(await Promise.all([1, 2].map(() => api('POST', `/memberships/${pending}/approve`, 'milan.petrovic'))))).toEqual([200, 409]);
+
+    const csv = 'datum,uplatilac,iznos,poziv na broj,svrha\n30. 10. 2026.,Paralelni Uplatilac,"1.234,00",,x';
+    await api('POST', `/buildings/${bulevar}/bank-imports`, 'milan.petrovic', { fileName: 'p.csv', csv });
+    const line = (await one(pool, "SELECT id FROM bank_import_lines WHERE payer = 'Paralelni Uplatilac'"))!.id;
+    const apartmentId = await apartment(7);
+    expect(statuses(await Promise.all([1, 2].map(() => api('POST', `/bank-lines/${line}/link`, 'milan.petrovic', { apartmentId }))))).toEqual([200, 409]);
+    expect(Number((await one(pool, 'SELECT COUNT(*) AS n FROM ledger_entries WHERE apartment_id = ? AND amount = 1234', [apartmentId]))!.n)).toBe(1);
+
+    const issue = await newIssue('Paralelno zatvaranje');
+    const invoicePath = await upload('milan.petrovic', 'r.pdf', 'application/pdf');
+    const photo = await upload('milan.petrovic', 'p.jpg', 'image/jpeg');
+    const before = (await api('GET', `/buildings/${bulevar}/budget`, 'milan.petrovic')).body.balance;
+    expect(statuses(await Promise.all([1, 2].map(() => api('POST', `/issues/${issue}/resolve`, 'milan.petrovic', { amount: 1000, invoicePath, photos: [photo] }))))).toEqual([200, 409]);
+    expect((await api('GET', `/buildings/${bulevar}/budget`, 'milan.petrovic')).body.balance).toBe(before - 1000);
+
+    const voting = await newIssue('Paralelno glasanje');
+    for (const contractor of ['Prvi', 'Drugi']) await api('POST', `/issues/${voting}/offers`, 'milan.petrovic', { contractor, price: 1000, durationDays: 1 });
+    const open = () => api('POST', `/issues/${voting}/vote-session`, 'milan.petrovic', { deadline: '2026-11-20T12:00:00+01:00', majorityRule: 'simple' });
+    expect(statuses(await Promise.all([open(), open()]))).toEqual([200, 409]);
+
+    const thread = (await api('POST', `/buildings/${bulevar}/threads`, 'jelena.kovac', { subject: 'Paralelni pristanak', body: 'Tekst poruke.' })).body.id;
+    await api('POST', `/threads/${thread}/request-conversion`, 'milan.petrovic');
+    expect(statuses(await Promise.all([1, 2].map(() => api('POST', `/threads/${thread}/respond-conversion`, 'jelena.kovac', { accept: true }))))).toEqual([200, 400]);
+    expect(Number((await one(pool, "SELECT COUNT(*) AS n FROM issues WHERE title = 'Paralelni pristanak'"))!.n)).toBe(1);
+  });
+
+  it('ponuda se ne povlači tokom glasanja, kad je izabrana ni dvaput', async () => {
+    const voting = await issueByTitle('Paralelno glasanje');
+    const offers = (await api('GET', `/issues/${voting}`, 'milan.petrovic')).body.offers;
+    expect((await api('POST', `/offers/${offers[0].id}/withdraw`, 'milan.petrovic')).body.code).toBe('voting');
+    const lift = (await api('GET', `/issues/${await issueByTitle('Lift staje između 3. i 4. sprata')}`, 'milan.petrovic')).body;
+    expect((await api('POST', `/offers/${lift.chosenOffer.id}/withdraw`, 'milan.petrovic')).body.code).toBe('chosen');
+    const other = lift.offers.find((o: any) => o.id !== lift.chosenOffer.id);
+    expect((await api('POST', `/offers/${other.id}/withdraw`, 'milan.petrovic')).status).toBe(200);
+    expect((await api('POST', `/offers/${other.id}/withdraw`, 'milan.petrovic')).status).toBe(409);
+  });
+
+  it('nepostojeći datum, budući datum i premali iznos daju 400, ne 500', async () => {
+    const expense = (body: object) => api('POST', `/buildings/${bulevar}/expenses`, 'milan.petrovic', { title: 'Test datuma', amount: 10, ...body });
+    for (const occurredOn of ['2026-02-30', '2026-13-45', '2099-01-01']) expect((await expense({ occurredOn })).status).toBe(400);
+    expect((await expense({ amount: 0.001 })).status).toBe(400);
+    const csv = 'datum,uplatilac,iznos,poziv na broj,svrha\n31. 2. 2026.,Neko,"100,00",,x';
+    expect((await api('POST', `/buildings/${bulevar}/bank-imports`, 'milan.petrovic', { fileName: 'd.csv', csv })).body.code).toBe('bad_csv');
+    const announcement = { type: 'info', title: 'Stara objava', body: 'Tekst objave.', expiresAt: '2026-10-01' };
+    expect((await api('POST', `/buildings/${bulevar}/announcements`, 'milan.petrovic', announcement)).status).toBe(400);
+  });
+
+  it('uplata sa ratom drugog stana se ne knjiži', async () => {
+    await createMonthlyCharges('2026-12-01');
+    const apartmentId = await apartment(7);
+    const charge = (await one(pool, "SELECT id FROM charges WHERE building_id = ? AND apartment_id <> ? AND period = '2026-12' LIMIT 1", [bulevar, apartmentId]))!.id;
+    const before = (await api('GET', `/buildings/${bulevar}/budget`, 'milan.petrovic')).body.balance;
+    expect((await api('POST', `/buildings/${bulevar}/payments`, 'milan.petrovic', { apartmentId, amount: 4000, chargeId: charge })).body.code).toBe('bad_charge');
+    expect((await api('GET', `/buildings/${bulevar}/budget`, 'milan.petrovic')).body.balance).toBe(before);
+    await exec(pool, "DELETE FROM charges WHERE period = '2026-12'");
+  });
+
+  it('stornirana uplata je označena u listi upravnika', async () => {
+    const payments = (await api('GET', `/buildings/${bulevar}/budget/manager`, 'milan.petrovic')).body.payments;
+    const target = payments.find((p: any) => !p.reversed && !p.reversal);
+    await api('POST', `/ledger/${target.id}/reverse`, 'milan.petrovic');
+    const after = (await api('GET', `/buildings/${bulevar}/budget/manager`, 'milan.petrovic')).body.payments;
+    expect(after.find((p: any) => p.id === target.id).reversed).toBe(true);
+    expect(after.some((p: any) => p.reversal)).toBe(true);
+  });
+
+  it('upload proverava sadržaj, ne samo MIME', async () => {
+    const boundary = '----t';
+    const body = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="x.png"\r\nContent-Type: image/png\r\n\r\n<html><script>alert(1)</script></html>\r\n--${boundary}--\r\n`;
+    const res = await app.inject({ method: 'POST', url: '/api/v1/uploads', headers: { authorization: `Bearer ${await login('milan.petrovic')}`, 'content-type': `multipart/form-data; boundary=${boundary}` }, payload: body });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('archived=false vraća aktuelne objave', async () => {
+    const current = (await api('GET', `/buildings/${bulevar}/announcements`, 'jelena.kovac')).body;
+    expect((await api('GET', `/buildings/${bulevar}/announcements?archived=false`, 'jelena.kovac')).body).toEqual(current);
+  });
+
+  it('isti refresh token sme da se ponovi samo jednom', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/auth/login', headers: { 'x-forwarded-for': '10.20.30.40' }, payload: { email: 'dragan.ilic@test.upravko.rs', password: 'Test1234!' } });
+    const refreshToken = JSON.parse(res.body).refreshToken;
+    const refresh = () => api('POST', '/auth/refresh', null, { refreshToken });
+    expect((await refresh()).status).toBe(200);
+    expect((await refresh()).status).toBe(200);
+    expect((await refresh()).status).toBe(401);
+  });
+
+  it('X-Forwarded-For koji upiše klijent ne zaobilazi limit prijave', async () => {
+    const limited = await buildApp();
+    await limited.ready();
+    const attempt = (i: number) => limited.inject({
+      method: 'POST', url: '/api/v1/auth/login', headers: { 'x-forwarded-for': `203.0.113.${i}, 198.51.100.7` },
+      payload: { email: 'milan.petrovic@test.upravko.rs', password: 'pogresna' },
+    });
+    const codes = [];
+    for (let i = 0; i < 11; i++) codes.push((await attempt(i)).statusCode);
+    await limited.close();
+    expect(codes.at(-1)).toBe(429);
+  });
+});
+
+describe('preplata po stanu', () => {
+  const mine = async () => (await api('GET', `/buildings/${bulevar}/budget`, 'jelena.kovac')).body.mine;
+  const apartment7 = async () => (await one(pool, 'SELECT id FROM apartments WHERE building_id = ? AND number = 7', [bulevar]))!.id as string;
+  const pay = async (amount: number) => api('POST', `/buildings/${bulevar}/payments`, 'milan.petrovic', { apartmentId: await apartment7(), amount });
+  const reverse = (id: string) => api('POST', `/ledger/${id}/reverse`, 'milan.petrovic');
+  // Stan 7 je do ovde sve platio; decembarska rata je otvorena rata za ove testove.
+  beforeAll(() => createMonthlyCharges('2026-12-01'));
+  afterAll(() => exec(pool, "DELETE FROM charges WHERE period IN ('2026-12', '2027-01')"));
+
+  it('delimična uplata ostaje preplata, a sledeća uplata zatvara ratu', async () => {
+    const start = await mine();
+    const rate = start.unpaid[0].amount;
+    const part = Math.round((rate - start.credit) / 2);
+    const first = await pay(part);
+    expect(first.status).toBe(200);
+    const half = await mine();
+    expect(half.unpaid).toHaveLength(start.unpaid.length);
+    expect(half.credit).toBe(start.credit + part);
+    expect(half.debt).toBe(start.debt - part);
+    expect(half.ips.amount).toBe(rate - start.credit - part);
+    const manager = (await api('GET', `/buildings/${bulevar}/budget/manager`, 'milan.petrovic')).body.overdue.find((o: any) => o.apartmentNumber === 7);
+    if (manager) expect(manager.credit).toBe(start.credit + part);
+
+    const rest = await pay(rate - start.credit - part);
+    const done = await mine();
+    expect(done.unpaid).toHaveLength(start.unpaid.length - 1);
+    expect(done.credit).toBe(0);
+
+    // Storno prve uplate ponovo otvara ratu; druga ostaje preplata.
+    await reverse(first.body.id);
+    const back = await mine();
+    expect(back.unpaid).toHaveLength(start.unpaid.length);
+    expect(back.credit).toBe(rate - part);
+    await reverse(rest.body.id);
+    const end = await mine();
+    expect(end.credit).toBe(start.credit);
+    expect(end.debt).toBe(start.debt);
+  });
+
+  it('nova mesečna rata se zatvara iz preplate', async () => {
+    const start = await mine();
+    const rate = start.unpaid[0].amount;
+    const open = start.unpaid.reduce((sum: number, c: any) => sum + c.amount, 0);
+    const paid = await pay(open - start.credit + rate);
+    expect((await mine()).credit).toBe(rate);
+    await createMonthlyCharges('2027-01-01');
+    const after = await mine();
+    expect(after.unpaid).toHaveLength(0);
+    expect(after.credit).toBe(0);
+    expect(after.paid.some((c: any) => c.period === '2027-01')).toBe(true);
+    await reverse(paid.body.id);
+    await exec(pool, "DELETE FROM charges WHERE period = '2027-01'");
+    expect((await mine()).credit).toBe(start.credit);
+  });
+
+  it('Platio/la sam i izvod računaju ratu umanjenu za preplatu', async () => {
+    const start = await mine();
+    const rate = start.unpaid[0].amount;
+    const part = 1000;
+    const first = await pay(part);
+    const owed = rate - start.credit - part;
+    const claim = await api('POST', `/buildings/${bulevar}/payment-claims`, 'jelena.kovac', { scope: 'next' });
+    expect(claim.body.amount).toBe(owed);
+    await api('POST', `/payment-claims/${claim.body.id}/confirm`, 'milan.petrovic');
+    const entry = await one(pool, 'SELECT l.id, l.amount FROM payment_claims p JOIN ledger_entries l ON l.id = p.ledger_entry_id WHERE p.id = ?', [claim.body.id]);
+    expect(entry!.amount).toBe(owed);
+    expect((await mine()).credit).toBe(0);
+    await reverse(entry!.id);
+
+    // Isto preko izvoda: iznos iz IPS koda se prepoznaje po pozivu na broj.
+    const ips = (await mine()).ips;
+    expect(ips.amount).toBe(owed);
+    const csv = `datum,uplatilac,iznos,poziv na broj,svrha\n30. 10. 2026.,Jelena,${owed},${ips.reference},rata`;
+    expect((await api('POST', `/buildings/${bulevar}/bank-imports`, 'milan.petrovic', { fileName: 'pp.csv', csv })).body).toEqual({ total: 1, matched: 1 });
+    expect((await mine()).unpaid).toHaveLength(start.unpaid.length - 1);
+    const line = await one(pool, 'SELECT ledger_entry_id FROM bank_import_lines WHERE reference = ? ORDER BY id DESC LIMIT 1', [ips.reference]);
+    await reverse(line!.ledger_entry_id);
+    await reverse(first.body.id);
+    expect((await mine()).credit).toBe(start.credit);
   });
 });

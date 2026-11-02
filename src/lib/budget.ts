@@ -46,14 +46,31 @@ export async function reservations(db: Db, buildingId: string) {
   return list;
 }
 
-/** Ukupan dospeli neplaćeni iznos. Stanarima se daje samo ovaj zbir, bez stanova i imena. */
+/**
+ * Preplata stana (SQL izraz): uplate i njihova storna minus rate koje su zatvorene.
+ * Vodi se iz knjige, bez posebne kolone, pa ne može da se raziđe sa uplatama.
+ */
+export const creditOf = (apartment: string) => `(
+  (SELECT COALESCE(SUM(cl.sign * cl.amount), 0) FROM ledger_entries cl WHERE cl.apartment_id = ${apartment} AND cl.type IN ('income', 'reversal'))
+  - (SELECT COALESCE(SUM(cc.amount), 0) FROM charges cc WHERE cc.apartment_id = ${apartment} AND cc.paid_at IS NOT NULL))`;
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+export async function apartmentCredit(db: Db, apartmentId: string): Promise<number> {
+  const row = await one(db, `SELECT ${creditOf('?')} AS credit`, [apartmentId, apartmentId]);
+  return round2(Number(row?.credit ?? 0));
+}
+
+/** Ukupan dospeli neplaćeni iznos, umanjen za preplate. Stanarima se daje samo ovaj zbir, bez stanova i imena. */
 export async function overdueTotal(db: Db, buildingId: string): Promise<number> {
   const row = await one(
     db,
-    'SELECT COALESCE(SUM(amount), 0) AS total FROM charges WHERE building_id = ? AND paid_at IS NULL AND cancelled_at IS NULL AND due_date < ?',
+    `SELECT COALESCE(SUM(GREATEST(d.due - ${creditOf('d.apartment_id')}, 0)), 0) AS total FROM (
+       SELECT apartment_id, SUM(amount) AS due FROM charges
+       WHERE building_id = ? AND paid_at IS NULL AND cancelled_at IS NULL AND due_date < ? GROUP BY apartment_id) d`,
     [buildingId, localDate()],
   );
-  return Number(row?.total ?? 0);
+  return round2(Number(row?.total ?? 0));
 }
 
 export async function addEntry(
@@ -75,22 +92,54 @@ export async function addEntry(
   return id;
 }
 
-/** Uplata se raspoređuje na najstarija neplaćena zaduženja stana. */
-export async function allocatePayment(db: Db, apartmentId: string, entryId: string, amount: number, chargeId?: string | null) {
-  const unpaid = await rows(
+/** Uplate stana se zaključavaju po stanu, da dve istovremene ne potroše istu preplatu. */
+const lockApartment = (db: Db, apartmentId: string) => one(db, 'SELECT id FROM apartments WHERE id = ? FOR UPDATE', [apartmentId]);
+
+/** Poslednja nestornirana uplata stana; na nju se vezuju rate zatvorene iz preplate. */
+const lastPayment = async (db: Db, apartmentId: string) =>
+  (await one(
     db,
-    `SELECT id, amount FROM charges WHERE apartment_id = ? AND paid_at IS NULL AND cancelled_at IS NULL ${chargeId ? 'AND id = ?' : ''} ORDER BY period FOR UPDATE`,
-    chargeId ? [apartmentId, chargeId] : [apartmentId],
-  );
-  let left = amount;
+    `SELECT l.id FROM ledger_entries l WHERE l.apartment_id = ? AND l.type = 'income'
+       AND NOT EXISTS (SELECT 1 FROM ledger_entries r WHERE r.reverses_entry_id = l.id)
+     ORDER BY l.occurred_on DESC, l.created_at DESC LIMIT 1`,
+    [apartmentId],
+  ))?.id as string | undefined;
+
+/**
+ * Preplata stana (uplata je već u knjizi) zatvara izabrane rate, pa najstarije otvorene.
+ * Ono što ne pokrije celu ratu ostaje preplata za sledeću.
+ */
+export async function allocatePayment(db: Db, apartmentId: string, entryId?: string | null, chargeIds: string[] = []) {
+  await lockApartment(db, apartmentId);
+  let left = await apartmentCredit(db, apartmentId);
   const paid: string[] = [];
-  for (const c of unpaid) {
+  if (left <= 0) return paid;
+  const entry = entryId ?? (await lastPayment(db, apartmentId));
+  if (!entry) return paid;
+  const unpaid = await rows(db, 'SELECT id, amount FROM charges WHERE apartment_id = ? AND paid_at IS NULL AND cancelled_at IS NULL ORDER BY period FOR UPDATE', [apartmentId]);
+  const ordered = [...unpaid.filter((c) => chargeIds.includes(c.id)), ...unpaid.filter((c) => !chargeIds.includes(c.id))];
+  for (const c of ordered) {
     if (left + 0.001 < c.amount) break;
-    await exec(db, 'UPDATE charges SET paid_at = ?, payment_entry_id = ? WHERE id = ?', [now(), entryId, c.id]);
+    await exec(db, 'UPDATE charges SET paid_at = ?, payment_entry_id = ? WHERE id = ?', [now(), entry, c.id]);
     left -= c.amount;
     paid.push(c.id);
   }
   return paid;
+}
+
+/** Posle storna: ako uplate više ne pokrivaju zatvorene rate, najnovije se ponovo otvaraju, pa se preplata raspoređuje iznova. */
+export async function rebalanceApartment(db: Db, apartmentId: string) {
+  await lockApartment(db, apartmentId);
+  let credit = await apartmentCredit(db, apartmentId);
+  if (credit < 0) {
+    const closed = await rows(db, 'SELECT id, amount FROM charges WHERE apartment_id = ? AND paid_at IS NOT NULL ORDER BY period DESC FOR UPDATE', [apartmentId]);
+    for (const c of closed) {
+      if (credit >= -0.001) break;
+      await exec(db, 'UPDATE charges SET paid_at = NULL, payment_entry_id = NULL WHERE id = ?', [c.id]);
+      credit += c.amount;
+    }
+  }
+  await allocatePayment(db, apartmentId);
 }
 
 export const buildingOf = (buildingId: string) => one(pool, 'SELECT * FROM buildings WHERE id = ?', [buildingId]);

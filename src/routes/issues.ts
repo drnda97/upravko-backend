@@ -146,6 +146,11 @@ async function issueFollowers(issue: Row, exclude: string) {
   return [...ids];
 }
 
+const isClosed = (issue: Row) => issue.status === 'resolved' || issue.status === 'rejected';
+
+/** Problem zaključan do kraja transakcije; status se proverava tek posle ovoga, da dva zahteva ne prođu oba. */
+const lockIssue = async (db: Db, id: string) => (await one(db, 'SELECT * FROM issues WHERE id = ? FOR UPDATE', [id]))!;
+
 const changed = (issue: Row) => {
   toBuilding(issue.building_id, 'issue', issue.id);
   toBuilding(issue.building_id, 'issues');
@@ -228,20 +233,23 @@ export async function issueRoutes(app: FastifyInstance) {
       status: z.enum(['reported', 'received', 'offers', 'planned', 'in_progress']).optional(),
       urgency: z.enum(['low', 'medium', 'high']).optional(),
     }).parse(req.body);
-    if (issue.status === 'resolved' || issue.status === 'rejected') throw conflict('closed', 'Problem je već zatvoren.');
-    await tx(async (db) => {
-      if (body.status && body.status !== issue.status) {
-        if (issue.status === 'voting') throw conflict('voting', 'Glasanje je u toku. Status se menja kad se završi.');
+    const statusChanged = await tx(async (db) => {
+      const current = await lockIssue(db, issue.id);
+      if (isClosed(current)) throw conflict('closed', 'Problem je već zatvoren.');
+      const statusChanged = !!body.status && body.status !== current.status;
+      if (statusChanged) {
+        if (current.status === 'voting') throw conflict('voting', 'Glasanje je u toku. Status se menja kad se završi.');
         await exec(db, 'UPDATE issues SET status = ? WHERE id = ?', [body.status, issue.id]);
-        await addEvent(db, issue.id, 'status_changed', uid, { from: issue.status, to: body.status });
+        await addEvent(db, issue.id, 'status_changed', uid, { from: current.status, to: body.status });
       }
-      if (body.urgency && body.urgency !== issue.urgency) {
+      if (body.urgency && body.urgency !== current.urgency) {
         await exec(db, 'UPDATE issues SET urgency = ? WHERE id = ?', [body.urgency, issue.id]);
-        await addEvent(db, issue.id, 'urgency_changed', uid, { from: issue.urgency, to: body.urgency });
+        await addEvent(db, issue.id, 'urgency_changed', uid, { from: current.urgency, to: body.urgency });
       }
+      return statusChanged;
     });
     changed(issue);
-    if (body.status && body.status !== issue.status) {
+    if (body.status && statusChanged) {
       pushLater(await issueFollowers(issue, uid), { title: issue.title, body: `Status: ${STATUS_LABEL[body.status]}`, data: { screen: 'issue', id: issue.id } });
     }
     return { ok: true };
@@ -251,7 +259,7 @@ export async function issueRoutes(app: FastifyInstance) {
     const uid = userId(req);
     const issue = await issueOr404((req.params as { id: string }).id);
     const access = await requireResident(uid, issue.building_id);
-    if (issue.status === 'resolved' || issue.status === 'rejected') throw conflict('closed', 'Problem je zatvoren.');
+    if (isClosed(issue)) throw conflict('closed', 'Problem je zatvoren.');
     try {
       await exec(pool, 'INSERT INTO issue_hurries (issue_id, apartment_id, user_id, created_at) VALUES (?, ?, ?, ?)', [issue.id, access.apartmentId, uid, now()]);
     } catch (err: any) {
@@ -282,7 +290,7 @@ export async function issueRoutes(app: FastifyInstance) {
     await requireManager(uid, issue.building_id);
     const body = z.object({
       contractor: z.string().trim().min(2, 'Unesite izvođača.').max(190),
-      price: z.coerce.number().positive('Unesite cenu.').max(1e10),
+      price: z.coerce.number().min(0.01, 'Unesite cenu.').max(1e10),
       durationDays: z.coerce.number().int().positive('Unesite rok.').max(3650),
       pdfPath: z.string().nullable().optional(),
       note: z.string().trim().max(2000).nullable().optional(),
@@ -290,15 +298,16 @@ export async function issueRoutes(app: FastifyInstance) {
     }).parse(req.body);
     await assertOwnUpload(pool, uid, body.pdfPath);
     for (const p of body.photos) await assertOwnUpload(pool, uid, p);
-    if (issue.status === 'resolved' || issue.status === 'rejected') throw conflict('closed', 'Problem je već zatvoren.');
     const offerId = uuid();
     await tx(async (db) => {
+      const current = await lockIssue(db, issue.id);
+      if (isClosed(current)) throw conflict('closed', 'Problem je već zatvoren.');
       await exec(db, 'INSERT INTO offers (id, issue_id, contractor, price, duration_days, pdf_path, note, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [offerId, issue.id, body.contractor, body.price, body.durationDays, body.pdfPath ?? null, body.note ?? null, uid, now()]);
       for (const [i, path] of body.photos.entries()) await exec(db, 'INSERT INTO offer_photos (id, offer_id, path, sort) VALUES (?, ?, ?, ?)', [uuid(), offerId, path, i]);
       await addEvent(db, issue.id, 'offer_added', uid, { contractor: body.contractor, price: body.price });
-      if (issue.status === 'reported' || issue.status === 'received') {
+      if (current.status === 'reported' || current.status === 'received') {
         await exec(db, "UPDATE issues SET status = 'offers' WHERE id = ?", [issue.id]);
-        await addEvent(db, issue.id, 'status_changed', uid, { from: issue.status, to: 'offers' });
+        await addEvent(db, issue.id, 'status_changed', uid, { from: current.status, to: 'offers' });
       }
     });
     changed(issue);
@@ -312,7 +321,13 @@ export async function issueRoutes(app: FastifyInstance) {
     const issue = await issueOr404(offer.issue_id);
     await requireManager(uid, issue.building_id);
     await tx(async (db) => {
-      await exec(db, 'UPDATE offers SET withdrawn_at = ? WHERE id = ? AND withdrawn_at IS NULL', [now(), offer.id]);
+      const current = await lockIssue(db, issue.id);
+      if (isClosed(current)) throw conflict('closed', 'Problem je zatvoren. Ponude ostaju u istoriji.');
+      // Glasovi za povučenu ponudu bi se izgubili, a glasanje bi moglo da ostane sa jednom ponudom.
+      if (current.status === 'voting') throw conflict('voting', 'Glasanje je u toku. Ponuda može da se povuče kad se glasanje završi.');
+      if (current.chosen_offer_id === offer.id) throw conflict('chosen', 'Ovo je izabrana ponuda i ne može da se povuče.');
+      const result = await exec(db, 'UPDATE offers SET withdrawn_at = ? WHERE id = ? AND withdrawn_at IS NULL', [now(), offer.id]);
+      if (!result.affectedRows) throw conflict('already_withdrawn', 'Ponuda je već povučena.');
       await addEvent(db, issue.id, 'offer_withdrawn', uid, { contractor: offer.contractor });
     });
     changed(issue);
@@ -325,14 +340,16 @@ export async function issueRoutes(app: FastifyInstance) {
     await requireManager(uid, issue.building_id);
     const body = z.object({ deadline: z.coerce.date(), majorityRule: z.enum(['simple', 'two_thirds']) }).parse(req.body);
     if (body.deadline <= now()) throw badRequest('bad_deadline', 'Rok mora da bude u budućnosti.');
-    const offers = await one(pool, 'SELECT COUNT(*) AS n FROM offers WHERE issue_id = ? AND withdrawn_at IS NULL', [issue.id]);
-    if (Number(offers?.n) < 2) throw badRequest('need_offers', 'Dodaj bar dve ponude pa otvori glasanje.');
-    if (await one(pool, 'SELECT 1 AS ok FROM votes_sessions WHERE issue_id = ? AND closed_at IS NULL', [issue.id])) throw conflict('already_open', 'Glasanje je već otvoreno.');
     const sessionId = uuid();
     await tx(async (db) => {
+      const current = await lockIssue(db, issue.id);
+      if (isClosed(current)) throw conflict('closed', 'Problem je već zatvoren.');
+      if (await one(db, 'SELECT 1 AS ok FROM votes_sessions WHERE issue_id = ? AND closed_at IS NULL', [issue.id])) throw conflict('already_open', 'Glasanje je već otvoreno.');
+      const offers = await one(db, 'SELECT COUNT(*) AS n FROM offers WHERE issue_id = ? AND withdrawn_at IS NULL', [issue.id]);
+      if (Number(offers?.n) < 2) throw badRequest('need_offers', 'Dodaj bar dve ponude pa otvori glasanje.');
       await exec(db, 'INSERT INTO votes_sessions (id, issue_id, deadline, majority_rule, opened_by, opened_at) VALUES (?, ?, ?, ?, ?, ?)', [sessionId, issue.id, body.deadline, body.majorityRule, uid, now()]);
       await exec(db, "UPDATE issues SET status = 'voting' WHERE id = ?", [issue.id]);
-      await addEvent(db, issue.id, 'status_changed', uid, { from: issue.status, to: 'voting' });
+      await addEvent(db, issue.id, 'status_changed', uid, { from: current.status, to: 'voting' });
       await addEvent(db, issue.id, 'vote_opened', uid, { deadline: body.deadline.toISOString() });
     });
     changed(issue);
@@ -399,16 +416,17 @@ export async function issueRoutes(app: FastifyInstance) {
     const issue = await issueOr404((req.params as { id: string }).id);
     await requireManager(uid, issue.building_id);
     const body = z.object({
-      amount: z.coerce.number().positive('Unesite iznos sa računa.').max(1e10),
+      amount: z.coerce.number().min(0.01, 'Unesite iznos sa računa.').max(1e10),
       invoicePath: z.string({ error: 'Račun je obavezan.' }).min(1, 'Račun je obavezan.'),
       photos: z.array(z.string()).min(1, 'Dodajte bar jednu sliku posle popravke.').max(6),
     }).parse(req.body);
     await assertOwnUpload(pool, uid, body.invoicePath);
     for (const p of body.photos) await assertOwnUpload(pool, uid, p);
-    if (issue.status === 'resolved' || issue.status === 'rejected') throw conflict('closed', 'Problem je već zatvoren.');
     await tx(async (db) => {
+      const current = await lockIssue(db, issue.id);
+      if (isClosed(current)) throw conflict('closed', 'Problem je već zatvoren.');
       const open = await one(db, 'SELECT id FROM votes_sessions WHERE issue_id = ? AND closed_at IS NULL', [issue.id]);
-      let chosen: string | null = issue.chosen_offer_id;
+      let chosen: string | null = current.chosen_offer_id;
       if (open) {
         const lead = await leadingOffer(db, open.id, issue.id);
         chosen = lead?.id ?? null;
@@ -430,8 +448,8 @@ export async function issueRoutes(app: FastifyInstance) {
     const issue = await issueOr404((req.params as { id: string }).id);
     await requireManager(uid, issue.building_id);
     const { reason } = z.object({ reason: z.string().trim().min(5, 'Unesite obrazloženje.').max(2000) }).parse(req.body);
-    if (issue.status === 'resolved' || issue.status === 'rejected') throw conflict('closed', 'Problem je već zatvoren.');
     await tx(async (db) => {
+      if (isClosed(await lockIssue(db, issue.id))) throw conflict('closed', 'Problem je već zatvoren.');
       await exec(db, "UPDATE votes_sessions SET closed_at = ? WHERE issue_id = ? AND closed_at IS NULL", [now(), issue.id]);
       await exec(db, "UPDATE issues SET status = 'rejected', rejected_reason = ? WHERE id = ?", [reason, issue.id]);
       await addEvent(db, issue.id, 'rejected', uid, { reason });

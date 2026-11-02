@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { exec, one, pool, rows, uuid } from '../db.js';
 import { buildingAccess, requireManager, residentIds, type Access } from '../lib/access.js';
 import { userId } from '../lib/auth.js';
-import { localDate, now } from '../lib/clock.js';
+import { isIsoDate, localDate, now } from '../lib/clock.js';
 import { notFound } from '../lib/errors.js';
 import { assertOwnUpload, fileInfo } from '../lib/files.js';
 import { pushLater } from '../lib/push.js';
@@ -30,7 +30,7 @@ export async function announcementRoutes(app: FastifyInstance) {
   app.get('/buildings/:id/announcements', async (req) => {
     const { id } = req.params as { id: string };
     const access = await buildingAccess(userId(req), id);
-    const { archived } = z.object({ archived: z.coerce.boolean().default(false) }).parse(req.query);
+    const { archived } = z.object({ archived: z.stringbool().default(false) }).parse(req.query);
     return listAnnouncements(access, archived);
   });
 
@@ -44,7 +44,7 @@ export async function announcementRoutes(app: FastifyInstance) {
       body: z.string().trim().min(3, 'Unesite tekst.').max(5000),
       attachmentPath: z.string().nullable().optional(),
       pinned: z.boolean().default(false),
-      expiresAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+      expiresAt: z.string().refine(isIsoDate, 'Datum nije ispravan.').refine((d) => d >= localDate(), 'Rok objave je već prošao.').nullable().optional(),
       eventAt: z.coerce.date().nullable().optional(),
       eventPlace: z.string().trim().max(190).nullable().optional(),
     }).parse(req.body);

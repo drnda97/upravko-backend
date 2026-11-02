@@ -1,9 +1,11 @@
 import cron from 'node-cron';
 import { exec, pool, rows, tx, uuid } from '../db.js';
 import { residentIds } from '../lib/access.js';
+import { allocatePayment, creditOf } from '../lib/budget.js';
 import { localDate, localPeriod, now } from '../lib/clock.js';
 import { pushLater } from '../lib/push.js';
 import { toBuilding } from '../lib/realtime.js';
+import { settleClaims } from '../routes/claims.js';
 import { closeSession } from '../routes/issues.js';
 
 export async function closeExpiredVotes() {
@@ -37,6 +39,13 @@ export async function createMonthlyCharges(today = localDate()) {
       .filter((a) => a.amount > 0)
       .map((a) => [uuid(), b.id, a.id, period, a.amount, dueDateFor(period, b.fee_day_of_month), now()]);
     if (values.length) await exec(pool, 'INSERT IGNORE INTO charges (id, building_id, apartment_id, period, amount, due_date, created_at) VALUES ?', [values]);
+    // Nova rata se odmah zatvara ako je stan ima dovoljno preplate.
+    const withCredit = await rows(pool, `SELECT a.id FROM apartments a WHERE a.building_id = ? AND ${creditOf('a.id')} > 0`, [b.id]);
+    for (const a of withCredit) {
+      await tx(async (db) => {
+        if ((await allocatePayment(db, a.id)).length) await settleClaims(db, a.id);
+      });
+    }
     toBuilding(b.id, 'budget');
   }
 }

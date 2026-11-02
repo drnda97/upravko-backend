@@ -12,6 +12,11 @@ const REPLAY_GRACE_MS = 30_000;
 
 export const hashPassword = (password: string) => bcrypt.hash(password, 10);
 export const checkPassword = (password: string, hash: string) => bcrypt.compare(password, hash);
+// Login radi isti bcrypt posao i kad nalog ne postoji (ili nema lozinku), da vreme odgovora
+// ne otkriva koji e-mailovi su registrovani. Hash se jednom izračuna pri startu.
+const DUMMY_HASH = bcrypt.hashSync('upravko-nepostojeci-nalog', 10);
+export const checkPasswordConstantTime = (password: string, hash: string | null | undefined) =>
+  bcrypt.compare(password, hash || DUMMY_HASH);
 export const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 export const randomToken = () => randomBytes(32).toString('base64url');
 
@@ -36,15 +41,20 @@ export async function issueTokens(db: Db, userId: string) {
   return { accessToken: signAccess(userId), refreshToken };
 }
 
+const expired = () => new ApiError(401, 'unauthorized', 'Sesija je istekla. Prijavite se ponovo.');
+// Oznaka za token koji je već iskoristio jedino dozvoljeno ponavljanje: daleko van tolerancije.
+const REPLAY_USED = new Date(0);
+
 /** Rotacija: stari refresh token se poništava pri svakoj upotrebi. */
 export async function rotateRefresh(token: string) {
   const row = await one(pool, 'SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = ?', [sha256(token)]);
-  // Kratka tolerancija: ako se odgovor izgubio na mreži, klijent sme da ponovi isti token.
-  const replayed = row?.revoked_at && Date.now() - row.revoked_at.getTime() > REPLAY_GRACE_MS;
-  if (!row || replayed || row.expires_at < new Date()) {
-    throw new ApiError(401, 'unauthorized', 'Sesija je istekla. Prijavite se ponovo.');
+  if (!row || row.expires_at < new Date()) throw expired();
+  const first = await exec(pool, 'UPDATE refresh_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [new Date(), row.id]);
+  if (!first.affectedRows) {
+    // Kratka tolerancija: ako se odgovor izgubio na mreži, klijent sme jednom da ponovi isti token.
+    const again = await exec(pool, 'UPDATE refresh_tokens SET revoked_at = ? WHERE id = ? AND revoked_at > ?', [REPLAY_USED, row.id, new Date(Date.now() - REPLAY_GRACE_MS)]);
+    if (!again.affectedRows) throw expired();
   }
-  if (!row.revoked_at) await exec(pool, 'UPDATE refresh_tokens SET revoked_at = ? WHERE id = ?', [new Date(), row.id]);
   return issueTokens(pool, row.user_id);
 }
 

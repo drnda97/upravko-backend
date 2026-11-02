@@ -5,8 +5,8 @@ import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { one, pool } from '../db.js';
 import { userId } from '../lib/auth.js';
-import { badRequest, forbidden, notFound } from '../lib/errors.js';
-import { ALLOWED_MIME, saveFile, signedUrl, verifySignature } from '../lib/files.js';
+import { ApiError, badRequest, forbidden, notFound } from '../lib/errors.js';
+import { ALLOWED_MIME, contentMatches, saveFile, signedUrl, verifySignature } from '../lib/files.js';
 
 export async function fileRoutes(app: FastifyInstance) {
   app.post('/api/v1/uploads', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (req) => {
@@ -15,6 +15,9 @@ export async function fileRoutes(app: FastifyInstance) {
     if (!file) throw badRequest('no_file', 'Fajl nije poslat.');
     if (!ALLOWED_MIME[file.mimetype]) throw badRequest('bad_file', 'Dozvoljene su slike i PDF.');
     const data = await file.toBuffer();
+    // Prekoračen limit: busboy skraćuje fajl, a toBuffer to ne prijavi uvek.
+    if (file.file.truncated) throw new ApiError(413, 'too_large', 'Fajl je veći od 15 MB.');
+    if (!contentMatches(file.mimetype, data)) throw badRequest('bad_file', 'Fajl nije ispravna slika ili PDF.');
     const name = await saveFile(pool, { data, mime: file.mimetype, originalName: file.filename, uploadedBy: uid });
     return { path: name, url: signedUrl(name), name: file.filename, sizeBytes: data.length, mime: file.mimetype };
   });
